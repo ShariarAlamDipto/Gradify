@@ -1,0 +1,282 @@
+
+!pip install azure-cognitiveservices-vision-computervision pdf2image Pillow opencv-python-headless tqdm transformers torch pdfplumber pymupdf
+!apt-get update
+!apt-get install -y poppler-utils tesseract-ocr
+
+
+import os
+import cv2
+import numpy as np
+from google.colab import files
+from pdf2image import convert_from_path
+import gc
+from tqdm.notebook import tqdm
+import logging
+from azure.cognitiveservices.vision.computervision import ComputerVisionClient
+from azure.cognitiveservices.vision.computervision.models import OperationStatusCodes
+from msrest.authentication import CognitiveServicesCredentials
+from PIL import Image
+from transformers import AutoTokenizer, AutoModelForCausalLM
+import torch
+import re
+import time
+import json
+import datetime
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(message)s')
+logger = logging.getLogger()
+
+# Azure Computer Vision credentials
+AZURE_KEY = "" 
+AZURE_ENDPOINT = ""  
+
+# Parameters
+OCR_DPI = 150          
+BATCH_SIZE = 1
+CACHE_FILE = "extracted_cache.txt"  
+CHUNK_SIZE = 3000     
+
+# ------------------- Initialize LLM for processing structured text ------------------- #
+# Using TinyLlama for CPU
+model_name_llm = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+tokenizer = AutoTokenizer.from_pretrained(model_name_llm)
+model = AutoModelForCausalLM.from_pretrained(model_name_llm, device_map="cpu")  
+tokenizer.pad_token = tokenizer.eos_token
+device = torch.device("cpu")
+logger.info(f"Using LLM device: {device}")
+
+# ------------------- Generic LLM Processing Function ------------------- #
+def process_with_llm_generic(prompt, text, max_new_tokens=500):
+    """
+    Processes the given text with the provided prompt using the LLM.
+    """
+    full_prompt = f"{prompt}\n\n{text}"
+    inputs = tokenizer(full_prompt, return_tensors='pt', truncation=True, max_length=1536, padding=True).to(device)
+    outputs = model.generate(
+        inputs['input_ids'],
+        attention_mask=inputs['attention_mask'],
+        max_new_tokens=max_new_tokens,
+        num_beams=1,
+        early_stopping=True,
+        pad_token_id=tokenizer.pad_token_id
+    )
+    result = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
+    gc.collect()
+    return result
+
+# ------------------- Functions for Text Correction and Summarization ------------------- #
+def chunk_text(text, max_length=CHUNK_SIZE):
+    paragraphs = text.split("\n")
+    chunks = []
+    current_chunk = ""
+    for para in paragraphs:
+        if len(current_chunk) + len(para) + 1 <= max_length:
+            current_chunk += para + "\n"
+        else:
+            if current_chunk:
+                chunks.append(current_chunk.strip())
+            current_chunk = para + "\n"
+    if current_chunk:
+        chunks.append(current_chunk.strip())
+    return chunks
+
+def correct_text_in_chunks(text):
+    chunks = chunk_text(text)
+    corrected_chunks = []
+    for chunk in chunks:
+        corrected = process_with_llm_generic(
+            "Correct the following OCR-extracted text to be clear, natural, and context-aware:",
+            chunk
+        )
+        corrected_chunks.append(corrected)
+    return "\n".join(corrected_chunks)
+
+def summarize_text(text):
+    return process_with_llm_generic(
+        "Summarize the following text naturally and concisely with domain-specific context in mind:",
+        text,
+        max_new_tokens=150
+    )
+
+# ------------------- Functions for Segmenting and Solving Questions ------------------- #
+def segment_qa(text):
+    segmentation_prompt = (
+        "You are an expert exam paper analyst. Given the following OCR-extracted text from an Edexcel IGCSE exam paper, "
+        "segment it into question clusters. For each cluster, output a JSON object with the keys 'question', 'response', "
+        "and 'marks'. If a cluster is missing a response or mark, output 'Not found' for that key. Then, compute the final total "
+        "marks by summing all numeric mark values (ignore non-numeric values). Return the complete output as a JSON object with keys "
+        "'clusters' (an array of objects) and 'final_marks' (a number)."
+    )
+    response = process_with_llm_generic(segmentation_prompt, text, max_new_tokens=500)
+    try:
+        segmentation = json.loads(response)
+    except Exception as e:
+        logger.error(f"Error parsing segmentation JSON: {e}")
+        segmentation = {"clusters": [], "final_marks": "Not calculated"}
+    return segmentation
+
+def solve_questions(text):
+    solving_prompt = (
+        "Solve the following questions from the exam paper. For each question, show detailed step-by-step calculations, "
+        "explain your reasoning, and convert any mathematical expressions into LaTeX format where possible."
+    )
+    return process_with_llm_generic(solving_prompt, text, max_new_tokens=500)
+
+# ------------------- Azure OCR Processing ------------------- #
+def preprocess_image(image):
+    # Minimal preprocessing; adjust as needed.
+    return image
+
+def process_ocr(img_path, computervision_client):
+    image = cv2.imread(img_path)
+    processed_image = preprocess_image(image)
+    temp_image_path = os.path.join(os.path.dirname(img_path), "processed_" + os.path.basename(img_path))
+    cv2.imwrite(temp_image_path, processed_image)
+    logger.info(f"Processed image saved as {temp_image_path}")
+
+    combined_text = ""
+    try:
+        with open(temp_image_path, "rb") as image_stream:
+            read_response = computervision_client.read_in_stream(image_stream, raw=True)
+            operation_location = read_response.headers["Operation-Location"]
+            operation_id = operation_location.split("/")[-1]
+
+            while True:
+                result = computervision_client.get_read_result(operation_id)
+                if result.status not in [OperationStatusCodes.running, OperationStatusCodes.not_started]:
+                    break
+                time.sleep(1)
+
+            if result.status == OperationStatusCodes.succeeded:
+                azure_text = "\n".join([line.text for page in result.analyze_result.read_results for line in page.lines])
+                logger.info(f"Azure OCR extracted text: {azure_text}")
+                combined_text += azure_text + "\n\n"
+            else:
+                logger.error(f"Azure OCR failed with status: {result.status}")
+    except Exception as e:
+        logger.error(f"Azure OCR error on {img_path}: {e}")
+
+    del image, processed_image
+    gc.collect()
+    return combined_text.strip()
+
+# ------------------- File Processing ------------------- #
+def process_file():
+    image_dir = "images"
+    os.makedirs(image_dir, exist_ok=True)
+
+    print("Please upload your PDF file:")
+    uploaded = files.upload()
+    if not uploaded:
+        logger.error("No file uploaded.")
+        return False, None, 0
+
+    uploaded_filename = next(iter(uploaded))
+    base_name = os.path.splitext(uploaded_filename)[0]
+    file_path = os.path.join(image_dir, uploaded_filename)
+
+    with open(uploaded_filename, 'rb') as f_in, open(file_path, 'wb') as f_out:
+        f_out.write(f_in.read())
+
+    logger.info(f"Converting {uploaded_filename} to images with DPI={OCR_DPI}...")
+    try:
+        pdf_images = convert_from_path(file_path, dpi=OCR_DPI, fmt='jpeg', thread_count=4)
+        logger.info(f"Converted PDF to {len(pdf_images)} images.")
+    except Exception as e:
+        logger.error(f"Error converting PDF: {e}")
+        return False, None, 0
+
+    image_paths = []
+    for i, img in enumerate(pdf_images):
+        img_path = os.path.join(image_dir, f"{base_name}_page_{i+1}.jpg")
+        img.save(img_path, 'JPEG', quality=95)
+        image_paths.append(img_path)
+        logger.info(f"Saved page {i+1} as {img_path}")
+
+    # Initialize Azure Computer Vision client
+    from azure.cognitiveservices.vision.computervision import ComputerVisionClient
+    from azure.cognitiveservices.vision.computervision.models import OperationStatusCodes
+    from msrest.authentication import CognitiveServicesCredentials
+    computervision_client = ComputerVisionClient(AZURE_ENDPOINT, CognitiveServicesCredentials(AZURE_KEY))
+
+    ocr_texts = []
+    for i in tqdm(range(0, len(image_paths), BATCH_SIZE), desc="Processing OCR Batches"):
+        batch_paths = image_paths[i:i+BATCH_SIZE]
+        for img_path in batch_paths:
+            text = process_ocr(img_path, computervision_client)
+            if text:
+                ocr_texts.append(text)
+            else:
+                logger.warning(f"No text extracted from {img_path}")
+        gc.collect()
+
+    extracted_text = "\n\n--- Page Break ---\n\n".join(ocr_texts)
+
+    raw_ocr_path = os.path.join(image_dir, f"{base_name}_raw_ocr.txt")
+    with open(raw_ocr_path, "w") as f:
+        f.write(extracted_text if extracted_text.strip() else "No text detected")
+    logger.info(f"Raw OCR output saved to '{raw_ocr_path}'")
+
+    if not extracted_text.strip():
+        logger.error("No text detected in the document by Azure OCR.")
+        return False, base_name, len(pdf_images)
+
+    # Correct text in chunks
+    corrected_text = correct_text_in_chunks(extracted_text)
+
+    # ------------------- Segmenting into Question Clusters & Final Marks ------------------- #
+    segmentation = segment_qa(corrected_text)
+    clusters = segmentation.get("clusters", [])
+    final_marks = segmentation.get("final_marks", "Not calculated")
+    questions = [cluster.get("question", "Not found") for cluster in clusters]
+    responses = [cluster.get("response", "Not found") for cluster in clusters]
+    marks = [cluster.get("marks", "Not found") for cluster in clusters]
+
+    # Save structured output files
+    questions_file_path = os.path.join(image_dir, f"{base_name}_questions.txt")
+    responses_file_path = os.path.join(image_dir, f"{base_name}_responses.txt")
+    marks_file_path = os.path.join(image_dir, f"{base_name}_marks.txt")
+    final_marks_file_path = os.path.join(image_dir, f"{base_name}_final_marks.txt")
+
+    with open(questions_file_path, "w") as f:
+        f.write("\n\n".join(questions))
+    with open(responses_file_path, "w") as f:
+        f.write("\n\n".join(responses))
+    with open(marks_file_path, "w") as f:
+        f.write("\n\n".join(marks))
+    with open(final_marks_file_path, "w") as f:
+        f.write(str(final_marks))
+
+    logger.info(f"Questions saved to '{questions_file_path}'")
+    logger.info(f"Responses saved to '{responses_file_path}'")
+    logger.info(f"Marks saved to '{marks_file_path}'")
+    logger.info(f"Final marks saved to '{final_marks_file_path}'")
+
+    print("📋 Structured Results:")
+    print("Questions:\n", "\n\n".join(questions), "\n")
+    print("Responses:\n", "\n\n".join(responses), "\n")
+    print("Marks:\n", "\n\n".join(marks), "\n")
+    print("Final Marks:", final_marks)
+
+    return True, base_name, len(pdf_images)
+
+# ------------------- Main Function ------------------- #
+def main():
+    success, base_name, num_pages = process_file()
+    if success:
+        print("\nProcess completed!")
+        for file in [
+            f"images/{base_name}_raw_ocr.txt",
+            f"images/{base_name}_questions.txt",
+            f"images/{base_name}_responses.txt",
+            f"images/{base_name}_marks.txt",
+            f"images/{base_name}_final_marks.txt"
+        ]:
+            if os.path.exists(file):
+                files.download(file)
+    else:
+        print("\nProcess failed. Check logs for details.")
+
+if __name__ == "__main__":
+    main()
